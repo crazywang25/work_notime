@@ -1,0 +1,14 @@
+// 로그인한 portal.posco.net의 즐겨찾기 URL로 등록해 실행합니다.
+javascript:void(function(){
+  if(location.origin!=="https://portal.posco.net"){alert("로그인한 NEXTEP 탭에서 실행해 주세요.");return;}
+  var w=window.open("about:blank","NEXTEP_PERSONAL_PROBE");
+  if(!w){alert("새 탭을 열 수 없습니다. 브라우저의 차단 안내를 확인해 주세요.");return;}
+  var d=w.document;
+  d.title="개인 NEXTEP 연결 확인";
+  d.body.textContent="기존 로그인으로 비근무 데이터를 조회하고 있습니다…";
+  d.body.style.cssText="font:20px system-ui;padding:48px;line-height:1.8;background:#f6f5fb;color:#252137";
+  fetch("/api/attend/briefing",{credentials:"same-origin",cache:"no-store",headers:{Accept:"application/json"}})
+    .then(function(r){if(!r.ok)throw Error("HTTP "+r.status);if(!/application\/json/i.test(r.headers.get("content-type")||""))throw Error("JSON 응답이 아닙니다. 로그인 상태를 확인해 주세요.");return r.json();})
+    .then(function(p){if(!p||!Array.isArray(p.today)||!Array.isArray(p.tomorrow))throw Error("응답 구조가 예상과 다릅니다.");d.body.textContent="연결 성공 · 새 탭 열림 · 기존 로그인으로 조회 완료\n오늘 "+p.today.length+"건 / 내일 "+p.tomorrow.length+"건\n개인별 정보는 저장하지 않았습니다.";d.body.style.whiteSpace="pre-line";})
+    .catch(function(e){d.body.textContent="연결 확인 실패: "+e.message;});
+}());

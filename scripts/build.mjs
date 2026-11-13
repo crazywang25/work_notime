@@ -1,0 +1,30 @@
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import vm from 'node:vm';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const read = name => readFile(path.join(root, name), 'utf8');
+const css = (await read('src/style.css')).trim();
+const scripts = await Promise.all(['src/core.mjs', 'src/ui.mjs', 'src/launcher.mjs'].map(read));
+// Source is kept readable; only known export declarations and whole-line comments are removed.
+const body = scripts.map(s => s.replace(/^export /gm, '').replace(/^\s*\/\/.*$/gm, '')).join('\n');
+const runtime = `(function(){'use strict';\n${body}\nlaunchNextep(createCore,mountNextep,${JSON.stringify(css)});\n}())`;
+new vm.Script(runtime, { filename: 'nextep-launcher.js' });
+const url = `javascript:void ${encodeURI(runtime).replaceAll('#', '%23')}`;
+const probe = (await read('probe.js')).split(/\r?\n/).filter(line => !line.trim().startsWith('//')).join(' ').trim();
+const out = path.join(root, 'dist');
+await mkdir(out, { recursive: true });
+await writeFile(path.join(out, 'nextep-launcher.js'), runtime);
+await writeFile(path.join(out, 'nextep-bookmarklet.txt'), url);
+await writeFile(path.join(out, 'probe-url.txt'), probe);
+const demoSource = (await read('src/demo.mjs')).replace(/^import .*;\r?\n/gm, '').replace(/^const css = await fetch\(new URL\('\.\/style\.css', import\.meta\.url\)\).*;$/m, `const css = ${JSON.stringify(css)};`);
+const demoScript = `${scripts.slice(0, 2).map(s => s.replace(/^export /gm, '')).join('\n')}\n${demoSource}`.replace(/<\/script/gi, '<\\/script');
+new vm.Script(demoScript);
+await writeFile(path.join(out, 'demo.html'), `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>개인 NEXTEP · 가상 데이터</title></head><body><script>${demoScript}</script></body></html>`);
+const escape = value => value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+const bookmarks = `<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">\n<TITLE>개인 NEXTEP</TITLE>\n<H1>개인 NEXTEP</H1>\n<DL><p>\n<DT><A HREF="${escape(url)}">개인 NEXTEP</A>\n</DL><p>\n`;
+await writeFile(path.join(out, 'nextep-favorites.html'), bookmarks);
+const install = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>개인 NEXTEP 등록 안내</title><style>body{font:15px/1.9 'Segoe UI','Malgun Gothic',sans-serif;background:#f7f5fc;color:#342d46;margin:0}main{max-width:780px;margin:45px auto;padding:35px;background:white;border:1px solid #e8e1f4;border-radius:18px}h1{margin:0;color:#6244ac;font-size:27px}h2{font-size:18px;margin-top:30px}p{color:#7b708f}button,.launch{background:#6a4ed0;color:white;border:0;border-radius:8px;padding:10px 18px;cursor:pointer;text-decoration:none;display:inline-block;font:inherit;margin:6px 9px 6px 0}textarea{width:100%;height:130px;box-sizing:border-box;border:1px solid #e1d8ed;border-radius:8px;padding:12px;font:12px/1.5 monospace;overflow-wrap:anywhere}li{padding:5px 0}strong{color:#513c78}.note{background:#f7f3ff;border-radius:9px;padding:14px 19px;font-size:13px}.small{font-size:12px}.status{min-height:25px;color:#685080}code{background:#f0edf7;padding:2px 5px;border-radius:3px}@media(max-width:800px){main{margin:15px;padding:23px}}</style></head><body><main><h1>나의 NEXTEP 시작하기</h1><p>EP 로그인은 그대로, 필요한 정보는 새 탭에서.</p><div class="note">실행 위치: VDI 또는 사내 PC의 <strong>로그인된 NEXTEP 탭</strong><br>아래 버튼은 즐겨찾기 등록용입니다. 이 안내 페이지에서는 실제 현황을 조회하지 않습니다.</div><h2>1. 실행 코드 복사</h2><button id="copy" type="button">실행 코드 복사</button><button id="select" type="button">코드 전체 선택</button><div id="status" class="status" role="status"></div><textarea id="code" readonly aria-label="즐겨찾기 URL에 붙여넣을 코드">${escape(url)}</textarea><h2>2. VDI 안에서 즐겨찾기 등록</h2><ol><li>로그인된 NEXTEP 탭에서 <strong>Ctrl+D → 더 보기</strong>를 누릅니다.</li><li>이름은 <strong>개인 NEXTEP</strong>로 지정합니다.</li><li><strong>URL 칸을 클릭 → Ctrl+A → Backspace</strong>로 기존 주소를 모두 지웁니다.</li><li>복사한 코드를 URL 칸에 붙여넣고 <strong>저장</strong>합니다. 시작 부분이 <code>javascript:</code>인지 확인합니다.</li><li>다시 NEXTEP 탭에서 즐겨찾기 목록의 <strong>개인 NEXTEP</strong>를 누르면 새 탭이 열립니다.</li></ol><p class="note"><strong>브라우저 주소창·검색창에는 붙여넣지 마세요.</strong><br>자동 입력이 VDI에 전달되지 않으면 위 순서로 직접 등록합니다. 등록 후 조회와 갱신은 자동으로 동작합니다.</p><h2>즐겨찾기를 가져오거나 드래그하는 방법</h2><p class="small">이 폴더의 <strong>nextep-favorites.html</strong>을 브라우저 즐겨찾기 가져오기로 등록할 수도 있습니다. 파일을 VDI로 옮길 수 있는 환경에서 사용하세요. 동일한 브라우저 안에서는 아래 버튼을 즐겨찾기 모음으로 드래그할 수 있습니다.</p><a class="launch" href="${escape(url)}">개인 NEXTEP</a><h2>사용 방법</h2><p>오늘·내일 전환, 이름 검색, 유형 필터, 수동 새로고침을 제공합니다. 화면이 보이는 동안 5분마다 갱신합니다. 로그인 만료 시 EP에서 다시 로그인한 뒤 새로고침을 누르세요.</p><p class="small">실제 데이터와 인증정보는 파일에 저장하지 않습니다. 실행 코드에는 외부 라이브러리나 외부 서버 연결이 없습니다. 사내 PC에서도 같은 코드로 등록한 뒤 EP 조회 권한과 접속 상태를 확인합니다.</p></main><script>const field=document.getElementById('code');const status=document.getElementById('status');function selectCode(){field.focus();field.select();status.textContent='전체 선택했습니다. Ctrl+C로 복사하세요.'}document.getElementById('select').onclick=selectCode;document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(field.value);status.textContent='복사했습니다. VDI의 즐겨찾기 URL 칸에 붙여넣으세요.'}catch{selectCode()}};</script></body></html>`;
+await writeFile(path.join(out, 'install.html'), install);
+console.log(`생성 완료: dist/ · 실행 코드 ${url.length.toLocaleString()}자 · 외부 의존성 없음`);

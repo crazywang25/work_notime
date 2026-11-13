@@ -1,0 +1,434 @@
+(function(){'use strict';
+function createCore() {
+  const INTERVAL = 300000;
+  const ZONE = 'Asia/Seoul';
+  const dateFormat = new Intl.DateTimeFormat('en-CA', { timeZone: ZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+  function dateKey(time = Date.now()) {
+    const parts = Object.fromEntries(dateFormat.formatToParts(new Date(time)).map(p => [p.type, p.value]));
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  }
+  function nextDate(key) {
+    const [y, m, d] = key.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+  }
+  function untilMidnight(time) {
+    const day = 86400000;
+    return day - ((time + 32400000) % day);
+  }
+  function error(code) {
+    const messages = {
+      AUTH: 'EP 로그인 또는 조회 권한을 확인한 뒤 다시 시도해 주세요. 자동 갱신을 멈췄습니다.',
+      NETWORK: '연결을 확인하지 못했습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요.',
+      TIMEOUT: '응답이 늦어 조회를 멈췄습니다. 잠시 후 다시 시도해 주세요.',
+      FORMAT: '원본 응답 형식이 변경되었거나 일부 데이터가 올바르지 않습니다.',
+      HTTP: '원본 서비스에서 조회하지 못했습니다. 잠시 후 다시 시도해 주세요.',
+      ROLLOVER: '날짜가 바뀌어 조회 결과를 사용할 수 없습니다. 다시 조회해 주세요.'
+    };
+    return Object.assign(new Error(messages[code] || messages.NETWORK), { code });
+  }
+  const text = (v, fallback) => typeof v === 'string' && v.trim() ? v.trim() : fallback;
+  function normalizeRecords(rows) {
+    if (!Array.isArray(rows) || rows.some(r => !r || typeof r !== 'object' || Array.isArray(r))) throw error('FORMAT');
+    const seen = new Set();
+    return rows.flatMap((r, index) => {
+      const id = typeof r.lid === 'string' && r.lid.trim() ? r.lid.trim() : typeof r.lid === 'number' && Number.isFinite(r.lid) ? String(r.lid) : null;
+      const record = { id, name: text(r.nm, '이름 미제공'), title: text(r.jt, '직급 미제공'), type: text(r.offName, '유형 미제공') };
+      const key = id ? JSON.stringify([id, record.name, record.title, record.type]) : `unknown:${index}`;
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [record];
+    });
+  }
+  function normalizePayload(payload, fetchedAt, day = dateKey(fetchedAt)) {
+    if (!payload || typeof payload !== 'object' || !Array.isArray(payload.today) || !Array.isArray(payload.tomorrow)) throw error('FORMAT');
+    return {
+      today: { date: day, records: normalizeRecords(payload.today) },
+      tomorrow: { date: nextDate(day), records: normalizeRecords(payload.tomorrow) },
+      fetchedAt
+    };
+  }
+  function summarize(records) {
+    const ids = new Set(records.filter(r => r.id !== null).map(r => r.id));
+    const types = new Map();
+    for (const row of records) types.set(row.type, (types.get(row.type) || 0) + 1);
+    return { people: ids.size, unknown: records.filter(r => r.id === null).length, records: records.length, types: [...types].sort((a, b) => a[0].localeCompare(b[0], 'ko')) };
+  }
+  function filterRecords(records, query = '', type = '') {
+    const search = query.trim().toLocaleLowerCase('ko');
+    return records.filter(r => (!search || r.name.toLocaleLowerCase('ko').includes(search)) && (!type || r.type === type));
+  }
+  function makeLoader({ fetchImpl, url, now = Date.now, timeoutMs = 20000, setTimer = setTimeout, clearTimer = clearTimeout, AbortControllerImpl = AbortController }) {
+    return async function loadAbsences({ signal } = {}) {
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const startedDay = dateKey(now());
+        const abort = new AbortControllerImpl();
+        let timedOut = false;
+        let rejectInterrupted;
+        const interrupted = new Promise((_, reject) => { rejectInterrupted = reject; });
+        const onAbort = () => { abort.abort(); rejectInterrupted(Object.assign(new Error('취소됨'), { name: 'AbortError' })); };
+        if (signal?.aborted) onAbort();
+        else signal?.addEventListener('abort', onAbort, { once: true });
+        const timer = setTimer(() => { timedOut = true; abort.abort(); rejectInterrupted(error('TIMEOUT')); }, timeoutMs);
+        try {
+          const work = async () => {
+            const response = await fetchImpl(url, { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' }, signal: abort.signal });
+            if (response.status === 401 || response.status === 403) throw error('AUTH');
+            if (!response.ok) throw error('HTTP');
+            const contentType = response.headers.get('content-type') || '';
+            if (/text\/html/i.test(contentType)) throw error('AUTH');
+            if (!/\bapplication\/(?:[\w.-]+\+)?json\b/i.test(contentType)) throw error('FORMAT');
+            try { return await response.json(); } catch { throw error('FORMAT'); }
+          };
+          const payload = await Promise.race([work(), interrupted]);
+          const fetchedAt = now();
+          if (dateKey(fetchedAt) !== startedDay) {
+            if (attempt === 0) continue;
+            throw error('ROLLOVER');
+          }
+          return normalizePayload(payload, fetchedAt, startedDay);
+        } catch (e) {
+          if (timedOut) throw error('TIMEOUT');
+          if (signal?.aborted) throw Object.assign(new Error('취소됨'), { name: 'AbortError' });
+          if (e?.code) throw e;
+          throw error('NETWORK');
+        } finally {
+          clearTimer(timer);
+          signal?.removeEventListener('abort', onAbort);
+        }
+      }
+    };
+  }
+  function createController({ loadAbsences, onChange = () => {}, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, visible = true, interval = INTERVAL }) {
+    let state = { status: 'idle', snapshot: null, error: null, inFlight: false, authStopped: false, lastAttemptAt: null };
+    let timer, currentAbort, pending, generation = 0, disposed = false;
+    const emit = () => onChange({ ...state });
+    const clear = () => { if (timer !== undefined) clearTimer(timer); timer = undefined; };
+    function schedule() {
+      clear();
+      if (disposed || !visible || state.inFlight || state.authStopped) return;
+      const remaining = Math.max(0, (state.lastAttemptAt ?? now()) + interval - now());
+      timer = setTimer(() => refresh(), Math.min(remaining, untilMidnight(now())));
+    }
+    function refresh({ force = false } = {}) {
+      if (disposed) return Promise.resolve();
+      if (state.inFlight && !force) return pending;
+      clear();
+      currentAbort?.abort();
+      const token = ++generation;
+      const requestAbort = new AbortController();
+      currentAbort = requestAbort;
+      state = { ...state, status: 'loading', error: null, inFlight: true, authStopped: false, lastAttemptAt: now() };
+      emit();
+      pending = Promise.resolve().then(() => loadAbsences({ signal: requestAbort.signal })).then(snapshot => {
+        if (disposed || token !== generation) return;
+        state = { ...state, status: 'ready', snapshot, error: null };
+      }).catch(e => {
+        if (disposed || token !== generation) return;
+        state = { ...state, status: 'error', error: e?.code ? e : error('NETWORK'), authStopped: e?.code === 'AUTH' };
+      }).finally(() => {
+        if (disposed || token !== generation) return;
+        state = { ...state, inFlight: false };
+        emit();
+        schedule();
+      });
+      return pending;
+    }
+    function setVisible(value) {
+      visible = value;
+      clear();
+      if (!visible || disposed || state.authStopped || state.inFlight) return;
+      const outdated = !state.snapshot || dateKey(now()) !== state.snapshot.today.date || now() - state.snapshot.fetchedAt >= interval;
+      if (outdated && (!state.error || now() - state.lastAttemptAt >= 5000)) refresh();
+      else schedule();
+    }
+    function dispose() { disposed = true; generation++; clear(); currentAbort?.abort(); }
+    return { start: () => refresh(), refresh, setVisible, dispose, getState: () => ({ ...state }) };
+  }
+  return { INTERVAL, ZONE, dateKey, nextDate, untilMidnight, error, normalizePayload, normalizeRecords, summarize, filterRecords, makeLoader, createController };
+}
+
+function mountNextep(win, core, options) {
+  const d = win.document;
+  const demo = Boolean(options.demo);
+  d.documentElement.lang = 'ko';
+  d.title = `${demo ? '[가상 데이터] ' : ''}개인 NEXTEP · 부서원 비근무 현황`;
+  const oldStyle = d.getElementById('personal-nextep-style');
+  oldStyle?.remove();
+  const style = d.createElement('style');
+  style.id = 'personal-nextep-style';
+  style.textContent = options.css;
+  d.head.append(style);
+  if (!win.getComputedStyle(d.documentElement).getPropertyValue('--violet').trim()) {
+    throw new Error('브라우저 정책 때문에 개인화 화면의 스타일을 적용하지 못했습니다.');
+  }
+  let controller;
+  let selected = 'today';
+  let query = '';
+  let filter = '';
+  let lastState;
+  let toastTimer;
+  const paths = {
+    focus: 'M4 4h6v16H4z M14 4h6v16h-6',
+    people: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M22 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75',
+    calendar: 'M8 2v4 M16 2v4 M3 10h18 M5 4h14a2 2 0 0 1 2 2v14H3V6a2 2 0 0 1 2-2 M7 14h2 M13 14h2 M7 18h2',
+    mail: 'M3 5h18v14H3z M3 5l9 8 9-8',
+    check: 'M5 12l4 4L19 6',
+    refresh: 'M20 7v5h-5 M4 17v-5h5 M6.1 7a7 7 0 0 1 11.55-1.7L20 8 M4 16l2.35 2.7A7 7 0 0 0 17.9 17',
+    search: 'M21 21l-5-5 M10 17a7 7 0 1 0 0-14 7 7 0 0 0 0 14',
+    arrow: 'M7 17L17 7 M7 7h10v10',
+    clock: 'M12 8v5l3 2 M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20',
+    info: 'M12 11v6 M12 7h.01 M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20',
+    grid: 'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z'
+  };
+  function icon(name, className = '') {
+    const svg = d.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    for (const [key, value] of Object.entries({ viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.7', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', class: `icon ${className}` })) svg.setAttribute(key, value);
+    const path = d.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', paths[name] || paths.info);
+    svg.append(path);
+    return svg;
+  }
+  function el(tag, props = {}, children = []) {
+    const node = d.createElement(tag);
+    for (const [key, value] of Object.entries(props)) {
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;
+      else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value);
+    }
+    node.append(...children);
+    return node;
+  }
+  const button = (text, className, action, children = []) => el('button', { type: 'button', class: className, onclick: action }, [...children, el('span', { text })]);
+  const toast = el('div', { class: 'toast', role: 'status', 'aria-live': 'polite' });
+  function notify(message) {
+    toast.textContent = message;
+    toast.classList.add('shown');
+    win.clearTimeout(toastTimer);
+    toastTimer = win.setTimeout(() => toast.classList.remove('shown'), 3500);
+  }
+  function navButton(name, label, action, active = false) {
+    const b = el('button', { type: 'button', class: `nav-button${active ? ' selected' : ''}`, title: label, 'aria-label': label, onclick: action }, [icon(name)]);
+    if (active) b.setAttribute('aria-current', 'page');
+    return b;
+  }
+  const goAbsences = () => { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); heading.focus({ preventScroll: true }); };
+  const prepare = () => notify('이 기능은 준비 중입니다. 현재는 부서원 비근무 조회를 사용할 수 있어요.');
+  const nav = el('nav', { class: 'rail', 'aria-label': '주 메뉴' }, [
+    el('div', { class: 'brand', text: 'p', title: '개인 NEXTEP' }),
+    navButton('focus', 'Smart Focus', () => win.scrollTo({ top: 0, behavior: 'smooth' })),
+    navButton('people', '부서원 비근무 현황', goAbsences, true),
+    navButton('calendar', '일정 · 준비 중', prepare),
+    navButton('mail', '메일 · 준비 중', prepare),
+    el('div', { class: 'rail-line' }),
+    navButton('grid', '추가 기능 · 준비 중', prepare),
+    el('span', { class: 'rail-bottom', text: 'MY', title: '개인용 화면' })
+  ]);
+  const side = el('aside', { class: 'todo-panel', 'aria-label': 'To-Do List 준비 화면' }, [
+    el('div', { class: 'todo-heading' }, [el('h2', { text: 'To-Do List' }), el('span', { class: 'plus', text: '+' })]),
+    el('div', { class: 'todo-tabs' }, [el('span', { class: 'active', text: '전체' }), el('span', { text: 'My' }), el('span', { text: '공유' })]),
+    el('div', { class: 'todo-empty' }, [el('div', { class: 'todo-graphic' }, [icon('check')]), el('h3', { text: '나에게 맞는 업무 공간' }), el('p', { text: '필요한 기능을 하나씩 담아보세요.\nTo-Do 연동은 준비 중입니다.' })]),
+    el('div', { class: 'side-note' }, [el('span', { class: 'eyebrow', text: 'FIRST CONNECTION' }), el('strong', { text: '부서원 비근무 현황' }), el('p', { text: '오늘과 내일의 현황부터\n한눈에 확인할 수 있어요.' }), button('현황 보러가기', 'text-button', goAbsences, [icon('arrow')])]),
+    el('div', { class: 'side-version', text: 'PERSONAL NEXTEP / 01' })
+  ]);
+  const sourceLink = el('a', { class: 'ep-link', href: 'https://portal.posco.net/', target: '_blank', rel: 'noopener' }, [el('span', { class: 'ep-symbol', text: 'EP' }), d.createTextNode('EP 바로가기'), icon('arrow')]);
+  const header = el('header', { class: 'topbar' }, [el('div', { class: 'top-title' }, [icon('focus'), el('h1', { text: 'Smart Focus' }), el('span', { class: 'personal-tag', text: '개인용' })]), sourceLink]);
+  const todayValue = el('strong', { text: '—' });
+  const tomorrowValue = el('strong', { text: '—' });
+  const connection = el('span', { class: 'connection-label', text: '연결 확인 중' });
+  const intro = el('section', { class: 'intro' }, [el('div', {}, [el('div', { class: 'eyebrow', text: 'MY WORKSPACE' }), el('h2', { text: '오늘의 업무, 조금 더 가볍게.' }), el('p', { text: '필요한 정보만 모아 나의 하루를 준비하세요.' })]), el('div', { class: 'connection' }, [el('span', { class: 'status-dot' }), connection])]);
+  const summary = el('section', { class: 'summary-strip', 'aria-label': '비근무 요약' }, [
+    el('div', { class: 'summary-name' }, [icon('people'), el('span', { text: '부서원 비근무' })]),
+    el('div', { class: 'summary-number' }, [el('span', { text: '오늘' }), todayValue]),
+    el('div', { class: 'summary-number' }, [el('span', { text: '내일' }), tomorrowValue]),
+    el('div', { class: 'summary-caption', text: '원본에 등록된 비근무 현황 기준' })
+  ]);
+  const heading = el('h2', { id: 'absence-heading', tabindex: '-1', text: '부서원 비근무 현황' });
+  const refresh = button('새로고침', 'refresh-button', () => controller.refresh(), [icon('refresh')]);
+  const dayTab = key => el('button', { type: 'button', id: `day-${key}`, class: 'day-tab', role: 'tab', 'aria-controls': 'absence-results', onclick: () => { selected = key; filter = ''; render(lastState); } });
+  const todayTab = dayTab('today');
+  const tomorrowTab = dayTab('tomorrow');
+  const tabs = el('div', { class: 'day-tabs', role: 'tablist', 'aria-label': '조회 날짜' }, [todayTab, tomorrowTab]);
+  tabs.addEventListener('keydown', e => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    selected = e.key === 'Home' ? 'today' : e.key === 'End' ? 'tomorrow' : selected === 'today' ? 'tomorrow' : 'today';
+    filter = '';
+    render(lastState);
+    (selected === 'today' ? todayTab : tomorrowTab).focus();
+  });
+  const autoLabel = el('span', { text: '5분마다 자동 갱신' });
+  const meta = el('span', { class: 'last-updated', text: '아직 조회하지 않았습니다' });
+  const searchInput = el('input', { id: 'name-search', type: 'search', placeholder: '이름으로 검색', autocomplete: 'off', 'aria-label': '부서원 이름 검색', oninput: e => { query = e.target.value; renderList(lastState); } });
+  const typeSelect = el('select', { id: 'type-filter', 'aria-label': '비근무 유형 필터', onchange: e => { filter = e.target.value; renderList(lastState); } });
+  const filters = el('div', { class: 'filters' }, [el('label', { class: 'search-box', for: 'name-search' }, [icon('search'), searchInput]), el('label', { class: 'type-select', for: 'type-filter' }, [el('span', { class: 'sr-only', text: '비근무 유형' }), typeSelect])]);
+  const alert = el('div', { class: 'notice', role: 'status', 'aria-live': 'polite' });
+  const resultTitle = el('h3', { text: '오늘의 비근무' });
+  const count = el('span', { class: 'count-label' });
+  const typeCounts = el('div', { class: 'type-counts', 'aria-label': '유형별 건수' });
+  const rows = el('div', { class: 'people-grid' });
+  const results = el('div', { id: 'absence-results', role: 'tabpanel', 'aria-labelledby': 'day-today', class: 'results' }, [el('div', { class: 'results-heading' }, [resultTitle, count]), typeCounts, rows]);
+  const card = el('section', { class: 'absence-card', 'aria-labelledby': 'absence-heading' }, [
+    el('div', { class: 'card-heading' }, [el('div', { class: 'card-title' }, [el('span', { class: 'title-icon' }, [icon('people')]), el('div', {}, [el('span', { class: 'eyebrow', text: 'TEAM AVAILABILITY' }), heading])]), refresh]),
+    el('div', { class: 'day-toolbar' }, [tabs, el('div', { class: 'update-info' }, [el('span', { class: 'auto-label' }, [el('span', { class: 'tiny-dot' }), autoLabel]), meta])]),
+    alert, filters, results,
+    el('div', { class: 'card-footnote' }, [icon('info'), el('span', { text: 'EP에 등록된 현황입니다. 목록에 없는 부서원의 근무 여부를 의미하지 않습니다.' })])
+  ]);
+  const futureCard = (name, title, body) => el('section', { class: 'future-card' }, [el('div', { class: 'future-heading' }, [el('div', { class: 'future-name' }, [icon(name), el('h3', { text: title })]), el('span', { class: 'coming-badge', text: '준비 중' })]), el('p', { text: body }), el('div', { class: 'future-lines' }, [el('span'), el('span')])]);
+  const future = el('div', { class: 'future-grid' }, [futureCard('calendar', '나의 일정', '오늘의 일정과 업무 흐름을 이곳에 모을 예정이에요.'), futureCard('mail', '메일 브리핑', '필요한 메일을 빠르게 확인할 수 있도록 준비하고 있어요.')]);
+  const footer = el('footer', { class: 'footer' }, [el('span', { text: 'PERSONAL NEXTEP' }), el('span', { text: '필요한 기능부터, 나의 방식으로.' })]);
+  const content = el('div', { class: 'content' }, [intro, summary, card, future, footer]);
+  if (demo) content.prepend(el('div', { class: 'demo-banner', role: 'note', text: '가상 데이터 미리보기 · 실제 부서원 정보가 아닙니다.' }));
+  const shell = el('div', { class: 'workspace' }, [nav, side, el('main', { class: 'main' }, [header, content])]);
+  d.body.replaceChildren(el('a', { href: '#absence-heading', class: 'skip-link', text: '비근무 현황으로 바로 이동' }), shell, toast);
+  if (options.demoControls) options.demoControls(d, content);
+  const clockFormat = new Intl.DateTimeFormat('ko-KR', { timeZone: core.ZONE, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const humanDate = key => new Intl.DateTimeFormat('ko-KR', { timeZone: core.ZONE, month: 'long', day: 'numeric', weekday: 'short' }).format(new Date(`${key}T00:00:00+09:00`));
+  const compactDate = key => key.slice(5).replace('-', '.');
+  function numberLabel(records) {
+    const s = core.summarize(records);
+    return s.unknown ? `${s.people}명 + 확인 필요` : `${s.people}명`;
+  }
+  function render(state) {
+    if (!state) return;
+    lastState = state;
+    const snapshot = state.snapshot;
+    const nowDay = core.dateKey();
+    const outdatedDay = snapshot && snapshot.today.date !== nowDay;
+    const day = snapshot?.today.date || nowDay;
+    todayTab.textContent = `오늘 ${compactDate(day)}`;
+    tomorrowTab.textContent = `내일 ${compactDate(snapshot?.tomorrow.date || core.nextDate(day))}`;
+    for (const [key, tab] of [['today', todayTab], ['tomorrow', tomorrowTab]]) {
+      tab.setAttribute('aria-selected', String(selected === key));
+      tab.tabIndex = selected === key ? 0 : -1;
+      tab.classList.toggle('active', selected === key);
+    }
+    results.setAttribute('aria-labelledby', `day-${selected}`);
+    results.setAttribute('aria-busy', String(state.inFlight));
+    refresh.disabled = state.inFlight;
+    refresh.classList.toggle('loading', state.inFlight);
+    refresh.lastChild.textContent = state.inFlight ? '조회 중' : state.authStopped ? '로그인 후 재시도' : '새로고침';
+    autoLabel.textContent = state.authStopped ? '자동 갱신 중지' : d.visibilityState === 'hidden' ? '자동 갱신 대기' : '5분마다 자동 갱신';
+    connection.textContent = demo ? '가상 데이터' : state.authStopped ? '로그인 확인 필요' : state.error ? '연결 확인 필요' : snapshot ? 'EP 연결됨' : '연결 확인 중';
+    connection.parentElement.classList.toggle('warning', Boolean(state.error));
+    todayValue.textContent = snapshot ? numberLabel(snapshot.today.records) : '—';
+    tomorrowValue.textContent = snapshot ? numberLabel(snapshot.tomorrow.records) : '—';
+    meta.textContent = snapshot ? `마지막 성공 ${snapshot.today.date} ${clockFormat.format(snapshot.fetchedAt)}` : '아직 조회하지 않았습니다';
+    const message = state.error ? `${state.error.message}${snapshot ? ' 아래는 이전 조회 결과입니다.' : ''}` : outdatedDay ? '날짜가 바뀌었습니다. 표시된 날짜의 이전 결과이며 새 현황을 조회 중입니다.' : '';
+    alert.hidden = !message;
+    alert.textContent = message;
+    alert.classList.toggle('error', Boolean(state.error));
+    searchInput.disabled = !snapshot;
+    typeSelect.disabled = !snapshot;
+    const available = core.summarize(snapshot?.[selected].records || []).types.map(([type]) => type);
+    if (filter && !available.includes(filter)) filter = '';
+    typeSelect.replaceChildren(el('option', { value: '', text: '모든 유형' }), ...available.map(type => el('option', { value: type, text: type })));
+    typeSelect.value = filter;
+    renderList(state);
+  }
+  function renderList(state) {
+    if (!state) return;
+    const day = state.snapshot?.[selected];
+    const all = day?.records || [];
+    const filtered = core.filterRecords(all, query, filter);
+    const summary = core.summarize(all);
+    const visibleSummary = core.summarize(filtered);
+    resultTitle.textContent = day ? `${humanDate(day.date)} 비근무` : `${selected === 'today' ? '오늘' : '내일'}의 비근무`;
+    count.textContent = day ? `${query || filter ? `검색 결과 ${visibleSummary.records}건 / ` : ''}총 ${summary.people}명${summary.unknown ? ` · 식별정보 없는 ${summary.unknown}건` : ''}` : '';
+    typeCounts.replaceChildren(...summary.types.map(([name, amount]) => el('span', { class: `type-chip ${typeColor(name)}` }, [d.createTextNode(name), el('strong', { text: `${amount}건` })])));
+    rows.replaceChildren();
+    if (!day) {
+      rows.append(el('div', { class: 'empty-state' }, [icon(state.error ? 'info' : 'refresh', state.inFlight ? 'spinning' : ''), el('strong', { text: state.error ? '현황을 불러오지 못했습니다' : '부서원 현황을 불러오고 있어요' }), el('p', { text: state.error ? '로그인과 연결 상태를 확인한 뒤 새로고침해 주세요.' : '오늘과 내일의 정보를 함께 확인합니다.' })]));
+      return;
+    }
+    if (!filtered.length) {
+      rows.append(el('div', { class: 'empty-state' }, [icon(all.length ? 'search' : 'check'), el('strong', { text: all.length ? '검색 조건에 맞는 부서원이 없습니다' : '등록된 비근무 현황이 없습니다' }), el('p', { text: all.length ? '다른 이름이나 유형으로 검색해 보세요.' : `${humanDate(day.date)} 기준 원본 조회 결과입니다.` }), ...(all.length ? [button('검색 조건 초기화', 'text-button', () => { query = ''; filter = ''; searchInput.value = ''; render(state); })] : [])]));
+      return;
+    }
+    for (const person of filtered) {
+      const avatar = el('span', { class: `avatar ${typeColor(person.type)}`, 'aria-hidden': 'true', text: Array.from(person.name)[0] });
+      rows.append(el('article', { class: 'person-card' }, [avatar, el('div', { class: 'person-details' }, [el('div', { class: 'person-name-line' }, [el('h4', { text: person.name }), el('span', { class: 'person-title', text: person.title })]), el('span', { class: `absence-type ${typeColor(person.type)}`, text: person.type })])]));
+    }
+  }
+  function typeColor(type) {
+    if (/휴가|연차|반차|휴무/.test(type)) return 'rose';
+    if (/출장|파견/.test(type)) return 'blue';
+    if (/교육|연수/.test(type)) return 'green';
+    return 'purple';
+  }
+  controller = core.createController({
+    loadAbsences: options.loadAbsences,
+    onChange: render,
+    visible: d.visibilityState !== 'hidden',
+    setTimer: win.setTimeout.bind(win),
+    clearTimer: win.clearTimeout.bind(win)
+  });
+  const onVisibility = () => { controller.setVisible(d.visibilityState !== 'hidden'); render(controller.getState()); };
+  const onPageShow = event => { if (event.persisted) controller.setVisible(d.visibilityState !== 'hidden'); };
+  const onPageHide = event => { if (event.persisted) controller.setVisible(false); else dispose(); };
+  d.addEventListener('visibilitychange', onVisibility);
+  win.addEventListener('pageshow', onPageShow);
+  win.addEventListener('pagehide', onPageHide);
+  function dispose() {
+    controller.dispose();
+    win.clearTimeout(toastTimer);
+    d.removeEventListener('visibilitychange', onVisibility);
+    win.removeEventListener('pageshow', onPageShow);
+    win.removeEventListener('pagehide', onPageHide);
+  }
+  render(controller.getState());
+  controller.start();
+  return { version: 1, refresh: () => controller.refresh(), dispose };
+}
+
+function launchNextep(createCore, mountNextep, css) {
+  const source = window;
+  const allowedOrigin = 'https://portal.posco.net';
+  if (source.location.origin !== allowedOrigin) {
+    source.alert('로그인한 NEXTEP 탭(portal.posco.net)에서 개인 NEXTEP 즐겨찾기를 눌러 주세요.');
+    return;
+  }
+  const key = '__personalNextepV1__';
+  const previous = source[key];
+  try {
+    if (previous && !previous.closed && previous[key]?.version === 1) {
+      previous.focus();
+      previous[key].refresh();
+      return;
+    }
+  } catch { /* A navigated tab must not be read or overwritten. */ }
+  const target = source.open('', 'NEXTEP_PERSONAL_V1');
+  if (!target) {
+    source.alert('새 탭을 열 수 없습니다. 브라우저의 차단 안내를 확인해 주세요.');
+    return;
+  }
+  try {
+    if (target[key]?.version === 1) {
+      source[key] = target;
+      target.focus();
+      target[key].refresh();
+      return;
+    }
+    if (target.location.href !== 'about:blank') {
+      source.alert('개인 NEXTEP 탭이 다른 페이지로 이동했습니다. 그 탭을 닫은 뒤 다시 실행해 주세요.');
+      return;
+    }
+    const core = createCore();
+    const loadAbsences = core.makeLoader({
+      fetchImpl: target.fetch.bind(target),
+      url: `${allowedOrigin}/api/attend/briefing`,
+      setTimer: target.setTimeout.bind(target),
+      clearTimer: target.clearTimeout.bind(target),
+      AbortControllerImpl: target.AbortController
+    });
+    source[key] = target;
+    target[key] = mountNextep(target, core, { css, loadAbsences });
+    target.focus();
+  } catch {
+    source.alert('새 탭에서 개인화 화면을 실행하지 못했습니다. 브라우저 정책 또는 로그인 상태를 확인해 주세요.');
+  }
+}
+
+launchNextep(createCore,mountNextep,":root{color-scheme:light;--ink:#272635;--muted:#7f7d90;--line:#ebeaf1;--violet:#6650df;--soft:#f3f0ff;--paper:#fff;font-family:\"Segoe UI\",\"Malgun Gothic\",system-ui,sans-serif;font-synthesis:none}\n*{box-sizing:border-box}body{margin:0;background:#f8f8fc;color:var(--ink);font-size:14px;line-height:1.6}button,input,select{font:inherit}button,a,input,select{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{cursor:wait;opacity:.6}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #907bf0;outline-offset:4px}a{color:inherit;text-decoration:none}button{color:inherit}h1,h2,h3,h4,p{margin:0}button{border:0;background:none}svg.icon{width:21px;height:21px;flex-shrink:0;vertical-align:middle}.workspace{display:grid;grid-template-columns:70px 252px minmax(0,1fr);min-height:100vh}.rail{background:#fcfbff;border-right:1px solid var(--line);display:flex;align-items:center;flex-direction:column;gap:16px;padding:18px 10px;position:sticky;top:0;height:100vh}.brand{font-size:43px;font-weight:500;line-height:1.1;color:#4c55b5;margin:0 0 25px;font-family:Georgia,serif}.nav-button{width:42px;height:44px;border-radius:12px;display:grid;place-items:center;color:#9691aa;transition:background .15s,color .15s}.nav-button:hover{background:#f0edf9;color:var(--violet)}.nav-button.selected{color:var(--violet);background:#eee9ff;box-shadow:inset 0 0 0 1px #e6dfff}.nav-button.selected .icon{stroke-width:2}.rail-line{width:24px;border-top:1px solid #ddd9e9;margin:4px 0}.rail-bottom{margin-top:auto;border-radius:50%;background:#e6e2f7;width:32px;height:32px;display:grid;place-items:center;font-size:10px;font-weight:700;color:#6a5a9c}.todo-panel{border-right:1px solid var(--line);background:#fff;display:flex;flex-direction:column;min-height:100vh;padding:25px 24px 20px}.todo-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.todo-heading h2{font-size:20px;letter-spacing:-.6px}.plus{display:grid;place-items:center;color:#beb7d4;background:#f5f2fc;border-radius:9px;width:30px;height:30px;font-size:24px}.todo-tabs{display:flex;gap:23px;padding-top:29px;border-bottom:1px solid var(--line);font-size:13px;color:#9692a7}.todo-tabs span{padding-bottom:12px}.todo-tabs .active{color:#454052;border-bottom:2px solid var(--violet);font-weight:700}.todo-empty{text-align:center;padding:52px 0 37px}.todo-graphic{width:58px;height:66px;display:grid;place-items:center;margin:0 auto 22px;background:linear-gradient(150deg,#f2edff,#f9f7ff);border:1px solid #e9e1fb;border-radius:12px;transform:rotate(-8deg);box-shadow:7px 5px 0 #f9f6ff}.todo-graphic .icon{width:28px;height:28px;color:#b7a6ed}.todo-empty h3{font-size:14px;margin-bottom:9px;font-weight:600}.todo-empty p,.side-note p{font-size:12px;color:var(--muted);white-space:pre-line;line-height:1.85}.side-note{background:#f9f7ff;border:1px solid #eee9fd;border-radius:14px;padding:20px 16px;margin-top:10px}.eyebrow{display:block;font-size:9px;font-weight:700;letter-spacing:1.7px;color:#998bbf;line-height:1.5}.side-note strong{display:block;margin:8px 0;font-size:13px}.text-button{display:inline-flex;gap:7px;align-items:center;color:var(--violet);font-size:12px;font-weight:600;padding:10px 0 0}.text-button .icon{width:14px;height:14px}.side-version{font-size:9px;letter-spacing:1.3px;color:#aaa5b7;margin-top:auto;padding-top:60px}.main{min-width:0}.topbar{height:82px;background:white;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 36px;gap:20px}.top-title{display:flex;align-items:center;gap:13px}.top-title>.icon{color:#8b819f}.top-title h1{font-size:23px;letter-spacing:-.65px;font-weight:650}.personal-tag{font-size:10px;color:#8a7cb3;background:#f5f2fc;border:1px solid #ece6f8;border-radius:5px;padding:2px 7px;margin-left:3px}.ep-link{display:inline-flex;align-items:center;gap:8px;border:1px solid #e5e2ee;border-radius:8px;padding:7px 11px;background:#fff;font-size:11px;font-weight:600}.ep-link>.icon{width:13px;height:13px;color:#928ba4}.ep-symbol{background:linear-gradient(140deg,#6ab6ee,#6056cc);color:white;font-size:8px;width:17px;height:17px;border-radius:4px;display:grid;place-items:center}.content{max-width:1400px;padding:37px 36px 20px;margin:auto}.intro{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:29px}.intro .eyebrow{color:#8d7ebb;margin-bottom:6px}.intro h2{font-size:25px;letter-spacing:-1.1px;line-height:1.45;font-weight:650}.intro p{font-size:12px;color:#8c879c;margin-top:7px}.connection{display:flex;align-items:center;gap:7px;font-size:10px;color:#817792;background:white;border:1px solid #ebe7f3;border-radius:30px;padding:7px 11px;white-space:nowrap}.status-dot,.tiny-dot{width:6px;height:6px;background:#71b29e;border-radius:50%;display:inline-block}.connection.warning .status-dot{background:#d99a65}.summary-strip{display:flex;align-items:center;gap:25px;padding:18px 23px;background:linear-gradient(110deg,#f2edff,#f9f7ff 70%,#f5f6ff);border:1px solid #e9e1fb;border-radius:12px;margin-bottom:25px}.summary-name{display:flex;align-items:center;gap:9px;font-size:12px;font-weight:600;color:#6c5b95;border-right:1px solid #dfd6f1;padding-right:25px}.summary-name .icon{width:18px;height:18px;color:#9a85c3}.summary-number{display:flex;align-items:baseline;gap:12px;color:#8d829f;font-size:12px}.summary-number strong{font-size:20px;font-weight:650;color:#6650bb;white-space:nowrap}.summary-caption{font-size:10px;color:#968ca6;margin-left:auto}.absence-card{background:var(--paper);border:1px solid #e8e5f0;border-radius:17px;box-shadow:0 5px 25px #32205e04;overflow:hidden;scroll-margin-top:25px}.card-heading{padding:25px 26px 21px;display:flex;align-items:center;justify-content:space-between;gap:16px}.card-title{display:flex;gap:13px;align-items:center}.title-icon{width:43px;height:43px;background:#f1edff;color:#8a70cd;display:grid;place-items:center;border-radius:12px}.card-title .eyebrow{font-size:8px;letter-spacing:1.7px;margin-bottom:3px}.card-title h2{font-size:19px;letter-spacing:-.7px;line-height:1.5;font-weight:650}.card-title h2:focus{outline:none}.refresh-button{display:flex;align-items:center;gap:7px;border:1px solid #e9e4f1;border-radius:8px;padding:8px 12px;font-size:11px;color:#6a627c;background:white;white-space:nowrap}.refresh-button:hover{background:#faf8ff;border-color:#cfc2ed}.refresh-button .icon{width:14px;height:14px}.refresh-button.loading .icon,.spinning{animation:spin 1.6s linear infinite}.day-toolbar{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:0 26px 19px;border-bottom:1px solid #f0edf5}.day-tabs{display:inline-flex;gap:3px;padding:4px;background:#f7f6fa;border-radius:9px}.day-tab{font-size:12px;color:#7e738d;padding:7px 14px;border-radius:6px;white-space:nowrap}.day-tab.active{color:#684bb5;background:#fff;box-shadow:0 1px 5px #27213d0b;font-weight:600}.update-info{display:flex;align-items:flex-end;flex-direction:column;gap:3px;font-size:9px;color:#aba4b5}.auto-label{display:flex;align-items:center;gap:5px;color:#8d819e;font-size:10px}.tiny-dot{width:5px;height:5px;background:#a996d8}.filters{display:flex;align-items:center;gap:10px;padding:22px 26px 0}.search-box{border:1px solid #eae6f0;background:#fff;border-radius:8px;display:flex;align-items:center;gap:9px;max-width:280px;flex:1;padding:8px 12px}.search-box>.icon{width:15px;height:15px;color:#aaa1b8}.search-box input{font-size:12px;border:0;min-width:0;width:100%;background:transparent;color:var(--ink);outline-offset:7px}.search-box input::placeholder{color:#80758e}.type-select select{border:1px solid #eae6f0;border-radius:8px;background:white;padding:8px 28px 8px 12px;color:#8e829f;font-size:11px;max-width:220px}.results{padding:23px 26px 25px;min-height:275px}.results-heading{display:flex;justify-content:space-between;gap:15px;align-items:center;margin-bottom:14px}.results-heading h3{font-size:13px;font-weight:600;color:#655c75}.count-label{font-size:11px;color:#786f84}.type-counts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:17px}.type-counts:empty{margin-bottom:0}.type-chip{display:inline-flex;gap:7px;align-items:center;border-radius:5px;padding:4px 8px;font-size:9px}.type-chip strong{font-weight:600;font-size:9px}.people-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.person-card{display:flex;align-items:center;gap:13px;border:1px solid #ebe7f2;border-radius:11px;padding:18px;min-width:0;transition:border-color .15s}.person-card:hover{border-color:#d6c9ed}.avatar{display:grid;place-items:center;width:42px;height:42px;flex-shrink:0;border-radius:50%;font-size:15px;font-weight:600}.person-details{min-width:0}.person-name-line{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap}.person-name-line h4{font-size:14px;font-weight:600;overflow-wrap:anywhere}.person-title{font-size:11px;color:#756c80;overflow-wrap:anywhere}.absence-type{display:inline-block;margin-top:4px;font-size:11px;background:transparent!important;overflow-wrap:anywhere}.purple{color:#76519e;background:#f4effb}.blue{color:#476b9b;background:#eef4fc}.green{color:#39705f;background:#edf7f2}.rose{color:#985d78;background:#fcf0f5}.card-footnote{display:flex;gap:7px;align-items:flex-start;font-size:10px;color:#81758f;padding:13px 26px;border-top:1px solid #f0edf5;background:#fdfcfe}.card-footnote .icon{width:13px;height:13px;margin-top:2px}.empty-state{grid-column:1/-1;text-align:center;display:flex;align-items:center;flex-direction:column;padding:25px 10px 37px;color:#a196b5}.empty-state>.icon{width:30px;height:30px;margin-bottom:16px;color:#b5a5d0}.empty-state strong{font-size:13px;font-weight:500;color:#857593}.empty-state p{font-size:11px;color:#aaa0b4;margin-top:6px}.notice{margin:17px 26px 0;padding:12px 14px;border-radius:8px;font-size:11px;line-height:1.8;color:#97714b;background:#fff8ed;border:1px solid #f5e5cd}.notice.error{background:#fff5f5;border-color:#f0dedd;color:#a66a69}.notice[hidden]{display:none}.future-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:22px}.future-card{border:1px solid #ebe8f1;border-radius:14px;background:#ffffffbd;padding:23px 24px}.future-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.future-name{display:flex;gap:10px;align-items:center}.future-name>.icon{color:#a99bc8;width:18px;height:18px}.future-name h3{font-size:13px;font-weight:600;color:#837790}.coming-badge{border:1px solid #ece8f2;background:#faf8fc;color:#b0a5bd;border-radius:4px;padding:1px 7px;font-size:9px;white-space:nowrap}.future-card p{font-size:11px;color:#aaa1b4;margin-top:13px}.future-lines{display:flex;flex-direction:column;gap:7px;margin-top:20px}.future-lines span{height:5px;background:#f4f1f8;border-radius:4px;width:84%}.future-lines span+span{width:55%}.footer{display:flex;justify-content:space-between;padding:25px 1px 0;font-size:9px;color:#b0a6bf}.footer span:first-child{letter-spacing:1.5px;font-size:8px}.demo-banner{background:#fff6df;border:1px solid #f2dfaa;border-radius:8px;padding:8px 13px;color:#9b7a38;font-size:11px;margin-bottom:24px}.demo-controls{display:flex;align-items:center;gap:10px;font-size:11px;color:#8f7b62;margin-top:20px;padding:13px;background:#fffaed;border-radius:8px;flex-wrap:wrap}.demo-controls select{font-size:11px;padding:4px 8px;border:1px solid #eddfbd;border-radius:5px;background:white}.demo-controls button{color:#806b48;border:1px solid #eddfbd;background:white;border-radius:5px;padding:4px 10px}.toast{position:fixed;bottom:30px;left:50%;transform:translate(-50%,14px);padding:13px 21px;border-radius:10px;background:#3c3350;color:white;box-shadow:0 5px 20px #2c25302a;max-width:calc(100vw - 40px);opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;font-size:12px;z-index:99}.toast.shown{opacity:1;transform:translate(-50%,0)}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}.skip-link{position:fixed;left:10px;top:-60px;background:white;padding:10px;z-index:100;color:var(--violet)}.skip-link:focus{top:10px}@keyframes spin{to{transform:rotate(360deg)}}@media(min-width:1700px){.workspace{grid-template-columns:74px 290px minmax(0,1fr)}.content{padding:45px 50px 24px}.todo-panel{padding-left:30px;padding-right:30px}.people-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:1200px){.workspace{grid-template-columns:62px 210px minmax(0,1fr)}.todo-panel{padding:25px 17px}.topbar{padding:0 25px}.content{padding:29px 24px 20px}.intro h2{font-size:22px}.summary-strip{gap:17px;padding:16px}.summary-name{padding-right:17px}.summary-caption{display:none}.card-heading{padding:22px}.day-toolbar{padding:0 22px 17px;align-items:flex-start}.day-tab{padding:6px 10px}.last-updated{font-size:8px}.filters{padding:20px 22px 0}.results{padding:20px 22px}.person-card{padding:15px 13px}.person-name-line{gap:4px}.card-footnote{padding:12px 22px}.future-card{padding:20px}.intro .connection{font-size:9px;padding:6px 9px}}@media(max-width:980px){.workspace{grid-template-columns:60px minmax(0,1fr)}.todo-panel{display:none}.intro h2{font-size:24px}.content{max-width:960px;padding:30px}.topbar{padding:0 30px}.summary-strip{gap:26px}.summary-caption{display:block}}@media(max-width:700px){.content{padding:22px 17px}.topbar{height:70px;padding:0 19px}.top-title{gap:9px}.top-title h1{font-size:19px}.personal-tag{display:none}.ep-link{font-size:10px}.ep-link .ep-symbol{display:none}.intro{align-items:flex-start}.intro h2{font-size:20px;letter-spacing:-.7px}.intro p{font-size:11px;max-width:190px}.connection{padding:5px 7px!important;font-size:8px!important;margin-top:5px}.summary-caption{display:none}.summary-strip{gap:18px;padding:14px}.summary-name{font-size:10px;gap:6px;padding-right:13px}.summary-number{font-size:10px;gap:6px}.summary-number strong{font-size:16px}.card-heading{padding:19px 17px}.title-icon{width:35px;height:35px}.card-title{gap:9px}.card-title h2{font-size:16px}.card-title .eyebrow{font-size:7px}.refresh-button{padding:7px 9px;font-size:10px;gap:4px}.day-toolbar{padding:0 17px 16px;flex-wrap:wrap;gap:10px}.update-info{flex-direction:row;gap:12px;align-items:center}.filters{padding:17px 17px 0;gap:7px}.search-box{padding:8px}.type-select select{max-width:135px;padding-right:17px;font-size:10px}.results{padding:20px 17px}.people-grid{grid-template-columns:1fr}.results-heading{align-items:flex-start}.results-heading h3{font-size:12px}.count-label{font-size:10px}.card-footnote{padding:12px 17px;font-size:9px}.notice{margin:15px 17px 0}.future-grid{gap:12px}.future-card{padding:16px}.future-heading{flex-wrap:wrap}.future-card p{font-size:10px}.footer{gap:20px;font-size:8px}.footer span:last-child{display:none}}@media(max-width:430px){.workspace{grid-template-columns:48px minmax(0,1fr)}.rail{padding:18px 5px;gap:15px}.nav-button{width:35px}.brand{font-size:36px}.content{padding:20px 12px}.topbar{padding:0 14px}.top-title>.icon{display:none}.intro h2{font-size:18px}.intro .connection{display:none}.summary-strip{gap:12px}.summary-name .icon{display:none}.summary-name{padding-right:12px}.summary-number strong{font-size:15px}.card-title .eyebrow{display:none}.card-title h2{font-size:14px}.title-icon{width:30px;height:30px}.refresh-button span{font-size:9px}.refresh-button .icon{width:12px}.card-heading{gap:8px;padding:17px 13px}.future-grid{grid-template-columns:1fr}.update-info{flex-direction:column;align-items:flex-start;gap:3px}.filters{flex-wrap:wrap}.search-box{max-width:none;flex-basis:100%}.type-select{width:100%}.type-select select{width:100%;max-width:none}.results-heading{flex-wrap:wrap;gap:5px}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}@media print{.rail,.todo-panel,.refresh-button,.filters,.future-grid,.ep-link,.demo-controls{display:none}.workspace{display:block}.topbar{height:auto;padding:10px 0}.content{padding:20px 0}.person-card{break-inside:avoid}.absence-card{box-shadow:none}.people-grid{grid-template-columns:repeat(2,1fr)}}");
+}())
